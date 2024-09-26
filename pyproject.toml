@@ -3,24 +3,24 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "[[PackageName]]"
-version = "[[Version number]]"
-description = "[[Short description]]"
+name = "OpenDiSFileReader"
+version = "2024.0"
+description = "File reader for the OpenDiS data format"
 keywords = ["ovito", "ovito-extension"]
-authors = [{name = "[[Author 1 name]]", email = "[[Author 1 email]]"}, {name = "[[Author 2 name]]", email = "[[Author 2 email]]"}]
-maintainers = [{name = "[[Maintainer 1 name]]", email = "[[Maintainer 1 email]]"}]
-license = {text = "[[License]]"}
+authors = [{name = "Daniel Utt", email = "utt@ovito.org"}]
+maintainers = [{name = "Daniel Utt", email = "utt@ovito.org"}]
+license = {text = "MIT"}
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.10"
 dependencies = [
-    "ovito >= 3.9.1",
+    "ovito >= 3.10.6",
 ]
 
 [project.urls]
-repository = "[[Repository Link]]"
+repository = "https://github.com/ovito-org/OpenDiSFileReader"
 
 [project.entry-points.'OVITO.FileReader']
-"[[Human readable file reader name]]" = "[[PackageName]]:[[FileReaderName]]"
+"OpenDiS File Reader" = "OpenDiSFileReader:OpenDiSFileReader"
 
 [tool.setuptools.packages.find]
 where = ["src"]
