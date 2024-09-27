@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "OpenDiSFileReader"
-version = "2024.0"
+version = "2024.1"
 description = "File reader for the OpenDiS data format"
 keywords = ["ovito", "ovito-extension"]
 authors = [{name = "Daniel Utt", email = "utt@ovito.org"}]
