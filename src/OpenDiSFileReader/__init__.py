@@ -28,6 +28,12 @@ class Node:
     num_arms: int
     arms: list[Arm]
     constrain: int
+    processed: bool = False
+
+
+@dataclass
+class Line:
+    segments: list[list[Node], list[Node]]
 
 
 class OpenDiSFileReader(FileReaderInterface):
@@ -194,6 +200,77 @@ class OpenDiSFileReader(FileReaderInterface):
             if point[i] >= cell[i, 3] + cell[i, i]:
                 return False
 
+    @staticmethod
+    def get_next_start_node(nodes: list[Node], start: int):
+        while start < len(nodes):
+            if nodes[start].num_arms == 2 and not nodes[start].processed:
+                return start, nodes[start]
+            start += 1
+        return None, None
+
+    @staticmethod
+    def walk_lines(nodes: list[Node]):
+        node_dict = {node.node_tag: node for node in nodes}
+
+        lines = []
+        start, start_node = __class__.get_next_start_node(nodes, 0)
+        while start_node is not None:
+            toProcess = [start_node]
+            fwd = 0
+            lines.append(Line([[], [start_node]]))
+            while toProcess:
+                node = toProcess.pop()
+                node.processed = True
+                lines[-1].segments[fwd].append(node)
+                for arm in node.arms:
+                    neigh_node = node_dict[arm.arm_tag]
+                    if not neigh_node.processed and neigh_node.num_arms < 3:
+                        toProcess.append(neigh_node)
+                    elif not neigh_node.processed:
+                        lines[-1].segments[fwd].append(neigh_node)
+                        fwd += 1
+            start, start_node = __class__.get_next_start_node(nodes, start)
+
+        return lines
+
+    @staticmethod
+    def walk_line(
+        segment: list[Node],
+        ref_point: np.ndarray,
+        cell: SimulationCell,
+        positions: list[np.ndarray],
+        sections: list[int],
+        bvecs: list[np.ndarray],
+        nvecs: list[np.ndarray],
+        counter: int,
+        rev: bool,
+    ):
+        for node_id in range(1, len(segment)):
+            n0 = segment[node_id - 1]
+            n1 = segment[node_id]
+
+            p0 = ref_point + cell.delta_vector(ref_point, n0.pos)
+            p1 = p0 + cell.delta_vector(p0, n1.pos)
+            ref_point = p1
+
+            positions.append(p0)
+            positions.append(p1)
+            sections.append(counter)
+            sections.append(counter)
+
+            matching_arm = None
+            for arm in n0.arms:
+                if arm.arm_tag == n1.node_tag:
+                    matching_arm = arm
+                    break
+            assert matching_arm is not None
+            bvecs.append(arm.bvec)
+            bvecs.append(arm.bvec)
+            nvecs.append(arm.nvec)
+            nvecs.append(arm.nvec)
+
+        return ref_point
+
     def parse(self, data: DataCollection, filename: str, **kwargs):
 
         with open(filename, "r") as f:
@@ -234,43 +311,30 @@ class OpenDiSFileReader(FileReaderInterface):
             constraint[i] = node.constrain
             yield i / len(body["nodalData"])
 
-        node_tags = {}
-        for i, node in enumerate(body["nodalData"]):
-            assert node.node_tag not in node_tags
-            node_tags[node.node_tag] = node
-            yield i / len(body["nodalData"])
+        positions = []
+        sections = []
+        bvecs = []
+        nvecs = []
+        counter = 0
+        lines = self.walk_lines(body["nodalData"])
+        for line in lines:
+            segment = list(reversed(line.segments[0]))
+            ref_point = np.asarray(segment[0].pos)
+            ref_point = self.walk_line(
+                segment, ref_point, cell, positions, sections, bvecs, nvecs, counter
+            )
+            segment = line.segments[1]
+            ref_point = self.walk_line(
+                segment, ref_point, cell, positions, sections, bvecs, nvecs, counter
+            )
+            counter += 1
 
         self.lines_vis.width = line_width
         self.lines_vis.color = color
         lines = data.lines.create("Arms", vis=self.lines_vis)
-        positions = []
-        section = []
-        bvecs = []
-        nvecs = []
-        counter = 0
-        for i, node in enumerate(body["nodalData"]):
-            p0 = np.asarray(cell.wrap_point(node.pos))
-            for arm in node.arms:
-
-                p1 = np.asarray(node_tags[arm.arm_tag].pos)
-                vec = cell.wrap_vector(p1 - p0)
-                p1 = p0 + vec
-
-                positions.append(p0)
-                positions.append(p1)
-
-                section.append(counter)
-                section.append(counter)
-                bvecs.append(arm.bvec)
-                bvecs.append(arm.bvec)
-
-                nvecs.append(arm.nvec)
-                nvecs.append(arm.nvec)
-                counter += 1
-            yield i / len(body["nodalData"])
 
         lines.create_property("Position", data=positions)
-        lines.create_property("Section", data=section)
+        lines.create_property("Section", data=sections)
         lines.create_property("Burgers vector", data=bvecs)
         lines.create_property(
             "Burgers vector magnitude", data=np.linalg.norm(bvecs, axis=1)
