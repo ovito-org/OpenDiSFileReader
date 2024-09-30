@@ -243,7 +243,6 @@ class OpenDiSFileReader(FileReaderInterface):
         bvecs: list[np.ndarray],
         nvecs: list[np.ndarray],
         counter: int,
-        rev: bool,
     ):
         for node_id in range(1, len(segment)):
             n0 = segment[node_id - 1]
