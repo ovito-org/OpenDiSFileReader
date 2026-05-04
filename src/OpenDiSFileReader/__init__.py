@@ -210,28 +210,37 @@ class OpenDiSFileReader(FileReaderInterface):
         return None, None
 
     @staticmethod
+    def trace_path(start: Node, arm: Arm, node_dict: dict) -> list[Node]:
+        segment = [start]
+        prev_tag = start.node_tag
+        curr = node_dict[arm.arm_tag]
+        while curr.num_arms == 2 and not curr.processed:
+            segment.append(curr)
+            curr.processed = True
+            for next_arm in curr.arms:
+                if next_arm.arm_tag != prev_tag:
+                    prev_tag = curr.node_tag
+                    curr = node_dict[next_arm.arm_tag]
+                    break
+        segment.append(curr)
+        return segment
+
+    @staticmethod
     def walk_lines(nodes: list[Node]):
         node_dict = {node.node_tag: node for node in nodes}
 
         lines = []
         start, start_node = __class__.get_next_start_node(nodes, 0)
         while start_node is not None:
-            toProcess = [start_node]
-            fwd = 0
-            lines.append(Line([[], [start_node]]))
-            while toProcess:
-                node = toProcess.pop()
-                node.processed = True
-                lines[-1].segments[fwd].append(node)
-                for arm in node.arms:
-                    neigh_node = node_dict[arm.arm_tag]
-                    if not neigh_node.processed and neigh_node.num_arms < 3:
-                        toProcess.append(neigh_node)
-                    elif not neigh_node.processed:
-                        lines[-1].segments[fwd].append(neigh_node)
-                        fwd += 1
+            yield
+            start_node.processed = True
+            segments = []
+            for arm in start_node.arms:
+                if not node_dict[arm.arm_tag].processed:
+                    segments.append(__class__.trace_path(start_node, arm, node_dict))
+            if segments:
+                lines.append(Line(segments))
             start, start_node = __class__.get_next_start_node(nodes, start)
-
         return lines
 
     @staticmethod
@@ -246,6 +255,7 @@ class OpenDiSFileReader(FileReaderInterface):
         counter: int,
     ):
         for node_id in range(1, len(segment)):
+            yield
             n0 = segment[node_id - 1]
             n1 = segment[node_id]
 
@@ -323,17 +333,15 @@ class OpenDiSFileReader(FileReaderInterface):
         bvecs = []
         nvecs = []
         counter = 0
-        lines = self.walk_lines(body["nodalData"])
+        lines = yield from self.walk_lines(body["nodalData"])
         for line in lines:
-            segment = list(reversed(line.segments[0]))
-            ref_point = np.asarray(segment[0].pos)
-            ref_point = self.walk_line(
-                segment, ref_point, cell, positions, sections, bvecs, nvecs, counter
-            )
-            segment = line.segments[1]
-            ref_point = self.walk_line(
-                segment, ref_point, cell, positions, sections, bvecs, nvecs, counter
-            )
+            for segment in line.segments:
+                segment = list(reversed(segment))
+                ref_point = np.asarray(segment[0].pos)
+                ref_point = yield from self.walk_line(
+                    segment, ref_point, cell, positions, sections, bvecs, nvecs, counter
+                )
+                yield
             counter += 1
 
         self.lines_vis.width = line_width
