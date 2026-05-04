@@ -203,7 +203,8 @@ class OpenDiSFileReader(FileReaderInterface):
     @staticmethod
     def get_next_start_node(nodes: list[Node], start: int):
         while start < len(nodes):
-            if nodes[start].num_arms == 2 and not nodes[start].processed:
+            # Any node that is not in a chain, either junction or end point
+            if nodes[start].num_arms != 2 and not nodes[start].processed:
                 return start, nodes[start]
             start += 1
         return None, None
@@ -252,9 +253,12 @@ class OpenDiSFileReader(FileReaderInterface):
             p1 = p0 + cell.delta_vector(p0, n1.pos)
             ref_point = p1
 
-            positions.append(p0)
+            new_segment = len(sections) == 0 or sections[-1] != counter
+
+            if new_segment:
+                positions.append(p0)
+                sections.append(counter)
             positions.append(p1)
-            sections.append(counter)
             sections.append(counter)
 
             matching_arm = None
@@ -262,11 +266,15 @@ class OpenDiSFileReader(FileReaderInterface):
                 if arm.arm_tag == n1.node_tag:
                     matching_arm = arm
                     break
-            assert matching_arm is not None
-            bvecs.append(arm.bvec)
-            bvecs.append(arm.bvec)
-            nvecs.append(arm.nvec)
-            nvecs.append(arm.nvec)
+            if matching_arm is None:
+                raise Exception(
+                    "Could not find matching arm for node {}".format(n1.node_tag)
+                )
+            if new_segment:
+                bvecs.append(matching_arm.bvec)
+                nvecs.append(matching_arm.nvec)
+            bvecs.append(matching_arm.bvec)
+            nvecs.append(matching_arm.nvec)
 
         return ref_point
 
