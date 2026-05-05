@@ -1,6 +1,7 @@
-#### OpenDiS File Reader ####
+### OpenDiS File Reader ####
 # File reader for the OpenDiS data format
 
+import copy
 import functools
 import operator
 from dataclasses import dataclass
@@ -8,7 +9,7 @@ from io import TextIOWrapper
 from typing import Callable
 
 import numpy as np
-from ovito.data import DataCollection, SimulationCell
+from ovito.data import DataCollection, ParticleType, SimulationCell
 from ovito.io import FileReaderInterface
 from ovito.traits import OvitoObject
 from ovito.vis import LinesVis
@@ -16,9 +17,9 @@ from ovito.vis import LinesVis
 
 @dataclass
 class Arm:
-    arm_tag: int
-    bvec: list[float]
-    nvec: list[float]
+    arm_tag: int  # node_tag of the neighbor this arm connects to
+    bvec: list[float]  # Burgers vector of this arm
+    nvec: list[float]  # slip plane normal vector of this arm
 
 
 @dataclass
@@ -28,11 +29,12 @@ class Node:
     num_arms: int
     arms: list[Arm]
     constrain: int
-    processed: bool = False
+    processed: bool = False  # set during line tracing to avoid revisiting
 
 
 @dataclass
 class Line:
+    # Each segment is a list of nodes forming one arm-chain from a junction outward.
     segments: list[list[Node], list[Node]]
 
 
@@ -40,9 +42,11 @@ class OpenDiSFileReader(FileReaderInterface):
     lines_vis = OvitoObject(
         LinesVis, shading=LinesVis.Shading.Normal, wrapped_lines=True
     )
+    particle_type = OvitoObject(ParticleType, name="Node")
 
     @staticmethod
     def detect(filename: str):
+        # OpenDiS data files always start with "dataFileVersion = ..."
         try:
             with open(filename, "r") as f:
                 line = f.readline()
@@ -51,6 +55,7 @@ class OpenDiSFileReader(FileReaderInterface):
             return False
 
     def scan(self, filename: str, register_frame: Callable[..., None]):
+        # OpenDiS files contain a single static snapshot
         register_frame(frame_info=(0, 0))
 
     @staticmethod
@@ -66,6 +71,8 @@ class OpenDiSFileReader(FileReaderInterface):
 
     @staticmethod
     def read_array(f: TextIOWrapper) -> list[int | float]:
+        # Reads one value per line until a line containing "]" is encountered.
+        # Called after the opening "[" has already been consumed by parse_header.
         array = []
         line = f.readline().strip()
         while "]" not in line:
@@ -78,11 +85,9 @@ class OpenDiSFileReader(FileReaderInterface):
     @staticmethod
     def parse_header(f: TextIOWrapper) -> dict[str : int | float | list[int | float]]:
         key = None
-        line = True
         header_end = "END OF DATA FILE PARAMETERS"
         header = {}
-        while line:
-            line = f.readline()
+        while line := f.readline():
             if header_end in line:
                 return header
 
@@ -93,6 +98,7 @@ class OpenDiSFileReader(FileReaderInterface):
                 key = line.split("=")[0].strip()
 
             if "[" in line:
+                # Value is a multi-line bracketed array; read until closing "]"
                 array = __class__.read_array(f)
                 assert key is not None
                 header[key] = array
@@ -116,6 +122,8 @@ class OpenDiSFileReader(FileReaderInterface):
 
     @staticmethod
     def parse_primary_line(line: str) -> Node:
+        # Lines may be prefixed with a domain tag: "domain,tag  x y z ..."
+        # Split on "," and take the last part to strip any domain prefix.
         line = line.strip().split(",")[-1]
         tokens = line.split()
         return Node(
@@ -128,6 +136,9 @@ class OpenDiSFileReader(FileReaderInterface):
 
     @staticmethod
     def parse_secondary_line(f: TextIOWrapper, num_arms: int) -> list[Arm]:
+        # Arms are stored in "secodary" lines, one per line arm and *num_arms* entries.
+        # Each arm's data consists of: arm_tag, bvec (3 floats), nvec (3 floats).
+        # This function reads all arms belonging to a node and returns them as a list
         arms = []
         current_arm = []
         while len(arms) < num_arms:
@@ -140,6 +151,7 @@ class OpenDiSFileReader(FileReaderInterface):
             tokens = line.split()
 
             if len(current_arm) == 0:
+                # First token on the first line of an arm entry is the neighbor tag
                 current_arm.append(int(tokens[0]))
                 tokens = tokens[1:]
             assert len(tokens) == 3 or len(tokens) == 6
@@ -155,11 +167,11 @@ class OpenDiSFileReader(FileReaderInterface):
 
     @staticmethod
     def parse_nodal_data(f: TextIOWrapper):
+        # Node records alternate between a primary line (tag, position, num_arms, constraint)
+        # and secondary lines (one entry per arm with bvec and nvec).
         data = []
-        line = True
         primary_line = True
-        while line:
-            line = f.readline()
+        while line := f.readline():
             if __class__.skip_line(line):
                 continue
 
@@ -175,10 +187,8 @@ class OpenDiSFileReader(FileReaderInterface):
     @staticmethod
     def parse_body(f: TextIOWrapper, num_domains: int):
         key = None
-        line = True
         body = {}
-        while line:
-            line = f.readline()
+        while line := f.readline():
             if __class__.skip_line(line):
                 continue
 
@@ -211,6 +221,8 @@ class OpenDiSFileReader(FileReaderInterface):
 
     @staticmethod
     def trace_path(start: Node, arm: Arm, node_dict: dict) -> list[Node]:
+        # Follow a chain of degree-2 nodes from start through arm until reaching
+        # a junction (num_arms != 2) or an already-processed node.
         segment = [start]
         prev_tag = start.node_tag
         curr = node_dict[arm.arm_tag]
@@ -227,6 +239,8 @@ class OpenDiSFileReader(FileReaderInterface):
 
     @staticmethod
     def walk_lines(nodes: list[Node]):
+        # Returns the collected Line objects; callers must use "yield from" to
+        # receive the return value while forwarding progress yields upstream.
         node_dict = {node.node_tag: node for node in nodes}
 
         lines = []
@@ -254,15 +268,20 @@ class OpenDiSFileReader(FileReaderInterface):
         nvecs: list[np.ndarray],
         counter: int,
     ):
+        # ref_point carries the last unwrapped position across calls so that
+        # delta_vector can resolve PBC images consistently along the full path.
         for node_id in range(1, len(segment)):
             yield
             n0 = segment[node_id - 1]
             n1 = segment[node_id]
 
+            # delta_vector returns the shortest-image displacement, respecting PBC
             p0 = ref_point + cell.delta_vector(ref_point, n0.pos)
             p1 = p0 + cell.delta_vector(p0, n1.pos)
             ref_point = p1
 
+            # Avoid duplicating the shared start point when appending the next
+            # segment from the same junction (sections[-1] already equals counter).
             new_segment = len(sections) == 0 or sections[-1] != counter
 
             if new_segment:
@@ -271,6 +290,7 @@ class OpenDiSFileReader(FileReaderInterface):
             positions.append(p1)
             sections.append(counter)
 
+            # Burgers vector and normal come from the arm in n0 that points to n1
             matching_arm = None
             for arm in n0.arms:
                 if arm.arm_tag == n1.node_tag:
@@ -292,7 +312,7 @@ class OpenDiSFileReader(FileReaderInterface):
 
         with open(filename, "r") as f:
             header = __class__.parse_header(f)
-            num_domains = functools.reduce(operator.mul, header["dataDecompGeometry"])
+            num_domains = np.prod(header["dataDecompGeometry"])
             body = __class__.parse_body(f, num_domains)
             assert len(body["nodalData"]) == header["nodeCount"]
 
@@ -305,8 +325,8 @@ class OpenDiSFileReader(FileReaderInterface):
             cell[i, i] = header["maxCoordinates"][i] - header["minCoordinates"][i]
         cell = data.create_cell(cell, pbc=(1, 1, 1))
 
-        line_width = 5 * np.linalg.norm(cell[:3, :3].diagonal()) / 1000
-        color = (255 / 255, 167 / 255, 26 / 255)
+        # Scale line/node width to ~0.5 % of the cell diagonal for visual clarity
+        self.lines_vis.width = 5 * np.linalg.norm(cell[:3, :3].diagonal()) / 1000
 
         particles = data.create_particles(count=header["nodeCount"])
         identifier = particles.create_property("Particle Identifier")
@@ -315,11 +335,9 @@ class OpenDiSFileReader(FileReaderInterface):
         num_arms = particles.create_property("Num Arms", dtype=int)
         constraint = particles.create_property("Constraint", dtype=int)
 
-        type_1 = particle_type.add_type_id(1, particles, name="node")
-        type_1.radius = line_width / 2
-        type_1.color = color
-
-        particle_type[:] = 1
+        self.particle_type.radius = self.lines_vis.width / 2
+        particle_type[:] = self.particle_type.id
+        particle_type.types_.append(copy.deepcopy(self.particle_type))
 
         for i, node in enumerate(body["nodalData"]):
             identifier[i] = node.node_tag
@@ -333,12 +351,16 @@ class OpenDiSFileReader(FileReaderInterface):
         bvecs = []
         nvecs = []
         counter = 0
+
+        # Line objects returned by the generator via its StopIteration value.
         lines = yield from self.walk_lines(body["nodalData"])
 
         ref_point = np.asarray(data.cell[:, 3])
         for line in lines:
             ref_point = data.cell.wrap_point(ref_point)
             for segment in line.segments:
+                # Reverse so the segment walks from the far end back to the junction,
+                # keeping ref_point continuous across consecutive segments of the line.
                 segment = list(reversed(segment))
                 ref_point = yield from self.walk_line(
                     segment,
@@ -350,13 +372,11 @@ class OpenDiSFileReader(FileReaderInterface):
                     nvecs,
                     counter,
                 )
-                yield
             counter += 1
 
-        self.lines_vis.width = line_width
-        self.lines_vis.color = color
-        lines = data.lines.create("Arms", vis=self.lines_vis)
+        self.lines_vis.color = self.particle_type.color
 
+        lines = data.lines.create("Arms", vis=self.lines_vis)
         lines.create_property("Position", data=positions)
         lines.create_property("Section", data=sections)
         lines.create_property("Burgers vector", data=bvecs)
