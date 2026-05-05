@@ -4,9 +4,10 @@
 import copy
 import functools
 import operator
+from collections.abc import Generator
 from dataclasses import dataclass
 from io import TextIOWrapper
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 from ovito.data import DataCollection, ParticleType, SimulationCell
@@ -35,7 +36,7 @@ class Node:
 @dataclass
 class Line:
     # Each segment is a list of nodes forming one arm-chain from a junction outward.
-    segments: list[list[Node], list[Node]]
+    segments: list[list[Node]]
 
 
 class OpenDiSFileReader(FileReaderInterface):
@@ -45,7 +46,7 @@ class OpenDiSFileReader(FileReaderInterface):
     particle_type = OvitoObject(ParticleType, name="Node")
 
     @staticmethod
-    def detect(filename: str):
+    def detect(filename: str) -> bool:
         # OpenDiS data files always start with "dataFileVersion = ..."
         try:
             with open(filename, "r") as f:
@@ -54,12 +55,12 @@ class OpenDiSFileReader(FileReaderInterface):
         except OSError:
             return False
 
-    def scan(self, filename: str, register_frame: Callable[..., None]):
+    def scan(self, filename: str, register_frame: Callable[..., None]) -> None:
         # OpenDiS files contain a single static snapshot
         register_frame(frame_info=(0, 0))
 
     @staticmethod
-    def skip_line(line: str):
+    def skip_line(line: str) -> bool:
         return line.startswith("#") or not line.strip()
 
     @staticmethod
@@ -83,7 +84,7 @@ class OpenDiSFileReader(FileReaderInterface):
         return array
 
     @staticmethod
-    def parse_header(f: TextIOWrapper) -> dict[str : int | float | list[int | float]]:
+    def parse_header(f: TextIOWrapper) -> dict[str, Any]:
         key = None
         header_end = "END OF DATA FILE PARAMETERS"
         header = {}
@@ -110,7 +111,7 @@ class OpenDiSFileReader(FileReaderInterface):
     @staticmethod
     def parse_domain_decomposition(
         f: TextIOWrapper, num_domains: int
-    ) -> list[float | int]:
+    ) -> list[list[float | int]]:
         data = []
         while len(data) < num_domains:
             line = f.readline().strip()
@@ -166,7 +167,7 @@ class OpenDiSFileReader(FileReaderInterface):
         return arms
 
     @staticmethod
-    def parse_nodal_data(f: TextIOWrapper):
+    def parse_nodal_data(f: TextIOWrapper) -> list[Node]:
         # Node records alternate between a primary line (tag, position, num_arms, constraint)
         # and secondary lines (one entry per arm with bvec and nvec).
         data = []
@@ -185,7 +186,7 @@ class OpenDiSFileReader(FileReaderInterface):
         return data
 
     @staticmethod
-    def parse_body(f: TextIOWrapper, num_domains: int):
+    def parse_body(f: TextIOWrapper, num_domains: int) -> dict[str, Any]:
         key = None
         body = {}
         while line := f.readline():
@@ -203,15 +204,18 @@ class OpenDiSFileReader(FileReaderInterface):
         return body
 
     @staticmethod
-    def point_in_cell(cell: SimulationCell, point: np.ndarray):
+    def point_in_cell(cell: SimulationCell, point: np.ndarray) -> bool:
         if np.any(point < cell[:, 3]):
             return False
         for i in range(3):
             if point[i] >= cell[i, 3] + cell[i, i]:
                 return False
+        return True
 
     @staticmethod
-    def get_next_start_node(nodes: list[Node], start: int):
+    def get_next_start_node(
+        nodes: list[Node], start: int
+    ) -> tuple[int, Node] | tuple[None, None]:
         while start < len(nodes):
             # Any node that is not in a chain, either junction or end point
             if nodes[start].num_arms != 2 and not nodes[start].processed:
@@ -220,7 +224,7 @@ class OpenDiSFileReader(FileReaderInterface):
         return None, None
 
     @staticmethod
-    def trace_path(start: Node, arm: Arm, node_dict: dict) -> list[Node]:
+    def trace_path(start: Node, arm: Arm, node_dict: dict[int, Node]) -> list[Node]:
         # Follow a chain of degree-2 nodes from start through arm until reaching
         # a junction (num_arms != 2) or an already-processed node.
         segment = [start]
@@ -238,15 +242,15 @@ class OpenDiSFileReader(FileReaderInterface):
         return segment
 
     @staticmethod
-    def walk_lines(nodes: list[Node]):
+    def walk_lines(nodes: list[Node]) -> Generator[float, None, list[Line]]:
         # Returns the collected Line objects; callers must use "yield from" to
         # receive the return value while forwarding progress yields upstream.
         node_dict = {node.node_tag: node for node in nodes}
 
         lines = []
         start, start_node = __class__.get_next_start_node(nodes, 0)
-        while start_node is not None:
-            yield
+        while start_node is not None and start is not None:
+            yield 0.0
             start_node.processed = True
             segments = []
             for arm in start_node.arms:
@@ -267,11 +271,11 @@ class OpenDiSFileReader(FileReaderInterface):
         bvecs: list[np.ndarray],
         nvecs: list[np.ndarray],
         counter: int,
-    ):
+    ) -> Generator[float, None, np.ndarray]:
         # ref_point carries the last unwrapped position across calls so that
         # delta_vector can resolve PBC images consistently along the full path.
         for node_id in range(1, len(segment)):
-            yield
+            yield 0.0
             n0 = segment[node_id - 1]
             n1 = segment[node_id]
 
@@ -308,7 +312,7 @@ class OpenDiSFileReader(FileReaderInterface):
 
         return ref_point
 
-    def parse(self, data: DataCollection, filename: str, **kwargs):
+    def parse(self, data: DataCollection, filename: str, **kwargs: Any) -> Generator[str | float, None, None] | None:  # type: ignore[override]
 
         with open(filename, "r") as f:
             header = __class__.parse_header(f)
@@ -323,7 +327,7 @@ class OpenDiSFileReader(FileReaderInterface):
         cell[:, 3] = header["minCoordinates"]
         for i in range(3):
             cell[i, i] = header["maxCoordinates"][i] - header["minCoordinates"][i]
-        cell = data.create_cell(cell, pbc=(1, 1, 1))
+        cell = data.create_cell(cell, pbc=(True, True, True))
 
         # Scale line/node width to ~0.5 % of the cell diagonal for visual clarity
         self.lines_vis.width = 5 * np.linalg.norm(cell[:3, :3].diagonal()) / 1000
