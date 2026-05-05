@@ -43,7 +43,6 @@ class OpenDiSFileReader(FileReaderInterface):
     lines_vis = OvitoObject(
         LinesVis, shading=LinesVis.Shading.Normal, wrapped_lines=True
     )
-    particle_type = OvitoObject(ParticleType, name="Node")
 
     @staticmethod
     def detect(filename: str) -> bool:
@@ -329,8 +328,8 @@ class OpenDiSFileReader(FileReaderInterface):
             cell[i, i] = header["maxCoordinates"][i] - header["minCoordinates"][i]
         cell = data.create_cell(cell, pbc=(True, True, True))
 
-        # Scale line/node width to ~0.5 % of the cell diagonal for visual clarity
-        self.lines_vis.width = 5 * np.linalg.norm(cell[:3, :3].diagonal()) / 1000
+        # Scale line/node width to ~0.1 % of the cell diagonal for visual clarity
+        self.lines_vis.width = 1 / 1000 * np.linalg.norm(cell[:3, :3].diagonal())
 
         particles = data.create_particles(count=header["nodeCount"])
         identifier = particles.create_property("Particle Identifier")
@@ -339,9 +338,9 @@ class OpenDiSFileReader(FileReaderInterface):
         num_arms = particles.create_property("Num Arms", dtype=int)
         constraint = particles.create_property("Constraint", dtype=int)
 
-        self.particle_type.radius = self.lines_vis.width / 2
-        particle_type[:] = self.particle_type.id
-        particle_type.types_.append(copy.deepcopy(self.particle_type))
+        node_type = particle_type.add_type_name("Node", data.particles)
+        node_type.radius = self.lines_vis.width / 2
+        particle_type[:] = node_type.id
 
         for i, node in enumerate(body["nodalData"]):
             identifier[i] = node.node_tag
@@ -378,7 +377,7 @@ class OpenDiSFileReader(FileReaderInterface):
                 )
             counter += 1
 
-        self.lines_vis.color = self.particle_type.color
+        self.lines_vis.color = node_type.color
 
         lines = data.lines.create("Arms", vis=self.lines_vis)
         lines.create_property("Position", data=positions)
