@@ -334,12 +334,21 @@ class OpenDiSFileReader(FileReaderInterface):
         nvecs = []
         counter = 0
         lines = yield from self.walk_lines(body["nodalData"])
+
+        ref_point = np.asarray(data.cell[:, 3])
         for line in lines:
+            ref_point = data.cell.wrap_point(ref_point)
             for segment in line.segments:
                 segment = list(reversed(segment))
-                ref_point = np.asarray(segment[0].pos)
                 ref_point = yield from self.walk_line(
-                    segment, ref_point, cell, positions, sections, bvecs, nvecs, counter
+                    segment,
+                    ref_point,
+                    cell,
+                    positions,
+                    sections,
+                    bvecs,
+                    nvecs,
+                    counter,
                 )
                 yield
             counter += 1
