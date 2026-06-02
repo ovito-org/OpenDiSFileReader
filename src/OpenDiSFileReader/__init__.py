@@ -379,7 +379,7 @@ class OpenDiSFileReader(FileReaderInterface):
 
         self.lines_vis.color = node_type.color
 
-        lines = data.lines.create("Arms", vis=self.lines_vis)
+        lines = data.lines.create("Arms", count=len(positions), vis=self.lines_vis)
         lines.create_property("Position", data=positions)
         lines.create_property("Section", data=sections)
         lines.create_property("Burgers vector", data=bvecs)
