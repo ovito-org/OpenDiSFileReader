@@ -1,16 +1,13 @@
 ### OpenDiS File Reader ####
 # File reader for the OpenDiS data format
 
-import copy
-import functools
-import operator
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from io import TextIOWrapper
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
-from ovito.data import DataCollection, ParticleType, SimulationCell
+from ovito.data import DataCollection, SimulationCell
 from ovito.io import FileReaderInterface
 from ovito.traits import OvitoObject
 from ovito.vis import LinesVis
@@ -232,11 +229,17 @@ class OpenDiSFileReader(FileReaderInterface):
         while curr.num_arms == 2 and not curr.processed:
             segment.append(curr)
             curr.processed = True
+            prev = curr
             for next_arm in curr.arms:
                 if next_arm.arm_tag != prev_tag:
                     prev_tag = curr.node_tag
                     curr = node_dict[next_arm.arm_tag]
                     break
+            if curr is prev:
+                # Degenerate two-node loop: both arms point back where we came
+                # from, so close the segment by stepping back there.
+                curr = node_dict[prev_tag]
+                break
         segment.append(curr)
         return segment
 
@@ -258,6 +261,17 @@ class OpenDiSFileReader(FileReaderInterface):
             if segments:
                 lines.append(Line(segments))
             start, start_node = __class__.get_next_start_node(nodes, start)
+
+        # Any node left unprocessed belongs to a closed loop, which has no junction
+        # or endpoint to start from. Pick an arbitrary node on each remaining loop.
+        for node in nodes:
+            if node.processed or not node.arms:
+                continue
+            yield 0.0
+            # Marking the start node first makes trace_path stop when it comes back
+            # around to it and append it, so the returned segment is closed.
+            node.processed = True
+            lines.append(Line([__class__.trace_path(node, node.arms[0], node_dict)]))
         return lines
 
     @staticmethod
@@ -300,9 +314,7 @@ class OpenDiSFileReader(FileReaderInterface):
                     matching_arm = arm
                     break
             if matching_arm is None:
-                raise Exception(
-                    "Could not find matching arm for node {}".format(n1.node_tag)
-                )
+                raise ValueError(f"Could not find matching arm for node {n1.node_tag}")
             if new_segment:
                 bvecs.append(matching_arm.bvec)
                 nvecs.append(matching_arm.nvec)
@@ -353,13 +365,12 @@ class OpenDiSFileReader(FileReaderInterface):
         sections = []
         bvecs = []
         nvecs = []
-        counter = 0
 
         # Line objects returned by the generator via its StopIteration value.
         lines = yield from self.walk_lines(body["nodalData"])
 
         ref_point = np.asarray(data.cell[:, 3])
-        for line in lines:
+        for counter, line in enumerate(lines):
             ref_point = data.cell.wrap_point(ref_point)
             for segment in line.segments:
                 # Reverse so the segment walks from the far end back to the junction,
@@ -375,9 +386,14 @@ class OpenDiSFileReader(FileReaderInterface):
                     nvecs,
                     counter,
                 )
-            counter += 1
 
         self.lines_vis.color = node_type.color
+
+        # Empty lists would be interpreted as shape (0,) arrays, which cannot be
+        # assigned to the (0, 3) vector properties, so give them the right shape.
+        positions = np.asarray(positions, dtype=float).reshape((-1, 3))
+        bvecs = np.asarray(bvecs, dtype=float).reshape((-1, 3))
+        nvecs = np.asarray(nvecs, dtype=float).reshape((-1, 3))
 
         lines = data.lines.create("Arms", count=len(positions), vis=self.lines_vis)
         lines.create_property("Position", data=positions)
