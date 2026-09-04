@@ -38,7 +38,7 @@ class Line:
 
 class OpenDiSFileReader(FileReaderInterface):
     lines_vis = OvitoObject(
-        LinesVis, shading=LinesVis.Shading.Normal, wrapped_lines=True
+        LinesVis, shading=LinesVis.Shading.Normal, wrapped_lines=True, title="Dislocations"
     )
 
     @staticmethod
@@ -343,7 +343,7 @@ class OpenDiSFileReader(FileReaderInterface):
         # Scale line/node width to ~0.1 % of the cell diagonal for visual clarity
         self.lines_vis.width = 1 / 1000 * np.linalg.norm(cell[:3, :3].diagonal())
 
-        particles = data.create_particles(count=header["nodeCount"])
+        particles = data.create_particles(count=header["nodeCount"], vis_params={'title': 'Nodes'})
         identifier = particles.create_property("Particle Identifier")
         particle_type = particles.create_property("Particle Type")
         positions = particles.create_property("Position")
@@ -398,8 +398,8 @@ class OpenDiSFileReader(FileReaderInterface):
         lines = data.lines.create("Arms", count=len(positions), vis=self.lines_vis)
         lines.create_property("Position", data=positions)
         lines.create_property("Section", data=sections)
-        lines.create_property("Burgers vector", data=bvecs)
+        lines.create_property("Burgers vector", data=bvecs, components=["X", "Y", "Z"])
         lines.create_property(
             "Burgers vector magnitude", data=np.linalg.norm(bvecs, axis=1)
         )
-        lines.create_property("Normal vector", data=nvecs)
+        lines.create_property("Normal vector", data=nvecs, components=["X", "Y", "Z"])
