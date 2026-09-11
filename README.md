@@ -6,7 +6,7 @@ An example for this type of data file can be found [here](https://github.com/Ope
 ![Example of an OpenDIS file imported into OVITO Pro](examples/OpenDISFileReader.png)
 
 ## Description
-This file reader imports the "nodes" in the OpenDIS file as particles and the "dislocation segments" or "arms" as [lines](https://docs.ovito.org/reference/pipelines/data_objects/lines.html) into OVITO. 
+This file reader imports the "nodes" in the OpenDIS file as particles and the "dislocation segments" as [lines](https://docs.ovito.org/reference/pipelines/data_objects/lines.html) into OVITO. 
 
 For more information and an example see this [discussion](https://github.com/OpenDiS/OpenDiS/issues/3).
 
@@ -25,7 +25,7 @@ For more information and an example see this [discussion](https://github.com/Ope
   ```
 
 ## Technical information / dependencies
-- Tested on OVITO version 3.10.6
+- Tested on OVITO version 3.16.0
 
 ## Contact
 For questions or support regarding this file reader, please contact:
