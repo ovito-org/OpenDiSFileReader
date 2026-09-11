@@ -1,39 +1,23 @@
-### OpenDiS File Reader ####
-# File reader for the OpenDiS data format
+### OpenDiS File Reader ###
+# File reader for the OpenDiS data formats
 
-from collections.abc import Callable, Generator
-from dataclasses import dataclass
+from collections.abc import Callable
 from io import TextIOWrapper
 from typing import Any
+import re
 
 import numpy as np
-from ovito.data import DataCollection, SimulationCell
+from ovito.data import DataCollection
 from ovito.io import FileReaderInterface
 from ovito.traits import OvitoObject
 from ovito.vis import LinesVis
 
 
-@dataclass
-class Arm:
-    arm_tag: int  # node_tag of the neighbor this arm connects to
-    bvec: list[float]  # Burgers vector of this arm
-    nvec: list[float]  # slip plane normal vector of this arm
-
-
-@dataclass
-class Node:
-    node_tag: int
-    pos: list[float]
-    num_arms: int
-    arms: list[Arm]
-    constrain: int
-    processed: bool = False  # set during line tracing to avoid revisiting
-
-
-@dataclass
-class Line:
-    # Each segment is a list of nodes forming one arm-chain from a junction outward.
-    segments: list[list[Node]]
+from enum import Enum
+class DDDFileFormat(Enum):
+    DATAFILE = 1
+    EXADIS_RESTART = 2
+    UNKNOWN = 3
 
 
 class OpenDiSFileReader(FileReaderInterface):
@@ -42,47 +26,75 @@ class OpenDiSFileReader(FileReaderInterface):
     )
 
     @staticmethod
-    def detect(filename: str) -> bool:
+    def detect_format(filename: str) -> DDDFileFormat:
         # OpenDiS data files always start with "dataFileVersion = ..."
+        # ExaDiS restart files always start with "# ExaDiS restart file"
         try:
             with open(filename, "r") as f:
-                line = f.readline()
-                return line.strip().startswith("dataFileVersion =")
+                line = f.readline().strip()
+                if line.startswith("dataFileVersion ="):
+                    return DDDFileFormat.DATAFILE
+                elif line.startswith("# ExaDiS restart file"):
+                    return DDDFileFormat.EXADIS_RESTART
+                else:
+                    return DDDFileFormat.UNKNOWN
+        except OSError:
+            return DDDFileFormat.UNKNOWN
+
+    @staticmethod
+    def detect(filename: str) -> bool:
+        try:
+            return __class__.detect_format(filename) != DDDFileFormat.UNKNOWN
         except OSError:
             return False
 
     def scan(self, filename: str, register_frame: Callable[..., None]) -> None:
         # OpenDiS files contain a single static snapshot
-        register_frame(frame_info=(0, 0))
-
+        file_format = __class__.detect_format(filename)
+        if file_format == DDDFileFormat.EXADIS_RESTART:
+            try:
+                header, *_ = __class__.parse_exadis_header(filename)
+                step_number = header["step"]
+                register_frame(frame_info=(step_number), label=f"Timestep {step_number}")
+            except OSError:
+                register_frame(frame_info=(0))
+        else:
+            register_frame(frame_info=(0))
+    
     @staticmethod
     def skip_line(line: str) -> bool:
         return line.startswith("#") or not line.strip()
-
+    
     @staticmethod
     def parse_number(number: str) -> int | float:
         try:
             return int(number)
         except ValueError:
             return float(number)
-
+    
     @staticmethod
-    def read_array(f: TextIOWrapper) -> list[int | float]:
-        # Reads one value per line until a line containing "]" is encountered.
+    def read_array(f: TextIOWrapper) -> list[int | float | list[int | float]]:
+        # Reads scalar values or vector rows until a line containing "]" is encountered.
         # Called after the opening "[" has already been consumed by parse_header.
         array = []
-        line = f.readline().strip()
-        while "]" not in line:
-            if line.startswith("#") or not line:
+        while line := f.readline():
+            array_end = "]" in line
+            line = line.split("#", 1)[0].replace("]", "").strip()
+            if not line:
+                if array_end:
+                    break
                 continue
-            array.append(__class__.parse_number(line))
-            line = f.readline().strip()
+            tokens = line.split()
+            values = [__class__.parse_number(token) for token in tokens]
+            array.append(values[0] if len(values) == 1 else values)
+            if array_end:
+                break
         return array
 
     @staticmethod
     def parse_header(f: TextIOWrapper) -> dict[str, Any]:
         key = None
-        header_end = "END OF DATA FILE PARAMETERS"
+        header_end = "nodalData"
         header = {}
         while line := f.readline():
             if header_end in line:
@@ -93,6 +105,9 @@ class OpenDiSFileReader(FileReaderInterface):
 
             if "=" in line:
                 key = line.split("=")[0].strip()
+
+            if key == "domainDecomposition":
+                continue
 
             if "[" in line:
                 # Value is a multi-line bracketed array; read until closing "]"
@@ -118,71 +133,67 @@ class OpenDiSFileReader(FileReaderInterface):
         return data
 
     @staticmethod
-    def parse_primary_line(line: str) -> Node:
-        # Lines may be prefixed with a domain tag: "domain,tag  x y z ..."
-        # Split on "," and take the last part to strip any domain prefix.
-        line = line.strip().split(",")[-1]
-        tokens = line.split()
-        return Node(
-            int(tokens[0]),
-            [float(t) for t in tokens[1:4]],
-            int(tokens[4]),
-            [],
-            int(tokens[5]),
-        )
-
-    @staticmethod
-    def parse_secondary_line(f: TextIOWrapper, num_arms: int) -> list[Arm]:
-        # Arms are stored in "secodary" lines, one per line arm and *num_arms* entries.
-        # Each arm's data consists of: arm_tag, bvec (3 floats), nvec (3 floats).
-        # This function reads all arms belonging to a node and returns them as a list
-        arms = []
-        current_arm = []
-        while len(arms) < num_arms:
-            line = f.readline()
-            if __class__.skip_line(line):
-                continue
-            if "," in line:
-                line = line.strip().split(",")[-1]
-
-            tokens = line.split()
-
-            if len(current_arm) == 0:
-                # First token on the first line of an arm entry is the neighbor tag
-                current_arm.append(int(tokens[0]))
-                tokens = tokens[1:]
-            assert len(tokens) == 3 or len(tokens) == 6
-            while tokens:
-                current_arm.append([float(t) for t in tokens[:3]])
-                tokens = tokens[3:]
-
-            assert len(current_arm) <= 3
-            if len(current_arm) == 3:
-                arms.append(Arm(*current_arm))
-                current_arm = []
-        return arms
-
-    @staticmethod
-    def parse_nodal_data(f: TextIOWrapper) -> list[Node]:
+    def parse_nodal_data(f: TextIOWrapper, node_count: int | None = None) -> tuple[np.ndarray, np.ndarray]:
         # Node records alternate between a primary line (tag, position, num_arms, constraint)
         # and secondary lines (one entry per arm with bvec and nvec).
-        data = []
-        primary_line = True
-        while line := f.readline():
-            if __class__.skip_line(line):
-                continue
+        nodes = np.empty((node_count, 6), dtype=float) if node_count else []
+        segs = []
+        nodes_map = {}
+        pending_segs: dict[tuple[int, int], list[int]] = {}
+        node_index = 0
 
-            if primary_line:
-                data.append(__class__.parse_primary_line(line))
-                primary_line = False
-            if not primary_line:
-                node = data[-1]
-                node.arms = __class__.parse_secondary_line(f, node.num_arms)
-                primary_line = True
-        return data
+        content = re.sub(r"(?m)#.*$", "", f.read()).replace(",", " ")
+        values = np.fromstring(content, sep=" ")
+        cursor = 0
+
+        while cursor < values.size:
+            domain = int(values[cursor])
+            tag = int(values[cursor + 1])
+            num_arms = int(values[cursor + 5])
+            node = [
+                domain, tag,
+                values[cursor + 2], values[cursor + 3], values[cursor + 4],
+                int(values[cursor + 6])
+            ]
+            cursor += 7
+
+            if node_count:
+                nodes[node_index] = node
+            else:
+                nodes.append(node)
+            node_tag = (node[0], node[1])
+            nodes_map[node_tag] = node_index
+
+            for seg_index in pending_segs.pop(node_tag, []):
+                segs[seg_index][1] = node_index
+
+            for _ in range(num_arms):
+                arm_tag = (int(values[cursor]), int(values[cursor + 1]))
+                if arm_tag in nodes_map:
+                    cursor += 8
+                    continue
+
+                pending_segs.setdefault(arm_tag, []).append(len(segs))
+                segs.append([
+                    node_index, -1,
+                    *values[cursor + 2:cursor + 5],
+                    *values[cursor + 5:cursor + 8]
+                ])
+                cursor += 8
+
+            node_index += 1
+
+        if pending_segs:
+            missing_tag = next(iter(pending_segs))
+            raise AssertionError(f"Nodal data references missing node tag {missing_tag}")
+
+        if node_count:
+            assert node_index == node_count
+
+        return np.asarray(nodes), np.asarray(segs, dtype=float).reshape((-1, 8))
 
     @staticmethod
-    def parse_body(f: TextIOWrapper, num_domains: int) -> dict[str, Any]:
+    def parse_body(f: TextIOWrapper, num_domains: int, node_count: int | None = None) -> dict[str, Any]:
         key = None
         body = {}
         while line := f.readline():
@@ -196,210 +207,314 @@ class OpenDiSFileReader(FileReaderInterface):
                 body[key] = __class__.parse_domain_decomposition(f, num_domains)
 
             if key == "nodalData":
-                body[key] = __class__.parse_nodal_data(f)
+                nodes, segs = __class__.parse_nodal_data(f, node_count)
+                body["nodes"] = nodes
+                body["segs"] = segs
         return body
 
     @staticmethod
-    def point_in_cell(cell: SimulationCell, point: np.ndarray) -> bool:
-        if np.any(point < cell[:, 3]):
-            return False
-        for i in range(3):
-            if point[i] >= cell[i, 3] + cell[i, i]:
-                return False
-        return True
-
-    @staticmethod
-    def get_next_start_node(
-        nodes: list[Node], start: int
-    ) -> tuple[int, Node] | tuple[None, None]:
-        while start < len(nodes):
-            # Any node that is not in a chain, either junction or end point
-            if nodes[start].num_arms != 2 and not nodes[start].processed:
-                return start, nodes[start]
-            start += 1
-        return None, None
-
-    @staticmethod
-    def trace_path(start: Node, arm: Arm, node_dict: dict[int, Node]) -> list[Node]:
-        # Follow a chain of degree-2 nodes from start through arm until reaching
-        # a junction (num_arms != 2) or an already-processed node.
-        segment = [start]
-        prev_tag = start.node_tag
-        curr = node_dict[arm.arm_tag]
-        while curr.num_arms == 2 and not curr.processed:
-            segment.append(curr)
-            curr.processed = True
-            prev = curr
-            for next_arm in curr.arms:
-                if next_arm.arm_tag != prev_tag:
-                    prev_tag = curr.node_tag
-                    curr = node_dict[next_arm.arm_tag]
-                    break
-            if curr is prev:
-                # Degenerate two-node loop: both arms point back where we came
-                # from, so close the segment by stepping back there.
-                curr = node_dict[prev_tag]
-                break
-        segment.append(curr)
-        return segment
-
-    @staticmethod
-    def walk_lines(nodes: list[Node]) -> Generator[float, None, list[Line]]:
-        # Returns the collected Line objects; callers must use "yield from" to
-        # receive the return value while forwarding progress yields upstream.
-        node_dict = {node.node_tag: node for node in nodes}
-
-        lines = []
-        start, start_node = __class__.get_next_start_node(nodes, 0)
-        while start_node is not None and start is not None:
-            yield 0.0
-            start_node.processed = True
-            segments = []
-            for arm in start_node.arms:
-                if not node_dict[arm.arm_tag].processed:
-                    segments.append(__class__.trace_path(start_node, arm, node_dict))
-            if segments:
-                lines.append(Line(segments))
-            start, start_node = __class__.get_next_start_node(nodes, start)
-
-        # Any node left unprocessed belongs to a closed loop, which has no junction
-        # or endpoint to start from. Pick an arbitrary node on each remaining loop.
-        for node in nodes:
-            if node.processed or not node.arms:
-                continue
-            yield 0.0
-            # Marking the start node first makes trace_path stop when it comes back
-            # around to it and append it, so the returned segment is closed.
-            node.processed = True
-            lines.append(Line([__class__.trace_path(node, node.arms[0], node_dict)]))
-        return lines
-
-    @staticmethod
-    def walk_line(
-        segment: list[Node],
-        ref_point: np.ndarray,
-        cell: SimulationCell,
-        positions: list[np.ndarray],
-        sections: list[int],
-        bvecs: list[np.ndarray],
-        nvecs: list[np.ndarray],
-        counter: int,
-    ) -> Generator[float, None, np.ndarray]:
-        # ref_point carries the last unwrapped position across calls so that
-        # delta_vector can resolve PBC images consistently along the full path.
-        for node_id in range(1, len(segment)):
-            yield 0.0
-            n0 = segment[node_id - 1]
-            n1 = segment[node_id]
-
-            # delta_vector returns the shortest-image displacement, respecting PBC
-            p0 = ref_point + cell.delta_vector(ref_point, n0.pos)
-            p1 = p0 + cell.delta_vector(p0, n1.pos)
-            ref_point = p1
-
-            # Avoid duplicating the shared start point when appending the next
-            # segment from the same junction (sections[-1] already equals counter).
-            new_segment = len(sections) == 0 or sections[-1] != counter
-
-            if new_segment:
-                positions.append(p0)
-                sections.append(counter)
-            positions.append(p1)
-            sections.append(counter)
-
-            # Burgers vector and normal come from the arm in n0 that points to n1
-            matching_arm = None
-            for arm in n0.arms:
-                if arm.arm_tag == n1.node_tag:
-                    matching_arm = arm
-                    break
-            if matching_arm is None:
-                raise ValueError(f"Could not find matching arm for node {n1.node_tag}")
-            if new_segment:
-                bvecs.append(matching_arm.bvec)
-                nvecs.append(matching_arm.nvec)
-            bvecs.append(matching_arm.bvec)
-            nvecs.append(matching_arm.nvec)
-
-        return ref_point
-
-    def parse(self, data: DataCollection, filename: str, **kwargs: Any) -> Generator[str | float, None, None] | None:  # type: ignore[override]
-
+    def parse_data_file(filename: str):
         with open(filename, "r") as f:
             header = __class__.parse_header(f)
-            num_domains = np.prod(header["dataDecompGeometry"])
-            body = __class__.parse_body(f, num_domains)
-            assert len(body["nodalData"]) == header["nodeCount"]
+            num_domains = int(np.prod(header["dataDecompGeometry"]))
+        with open(filename, "r") as f:
+            body = __class__.parse_body(f, num_domains, header.get("nodeCount"))
 
-        for k, v in header.items():
-            data.attributes[k] = v
-
+        header["segmentCount"] = len(body["segs"])
+        pbc = (True, True, True)
         cell = np.zeros((3, 4))
         cell[:, 3] = header["minCoordinates"]
         for i in range(3):
             cell[i, i] = header["maxCoordinates"][i] - header["minCoordinates"][i]
-        cell = data.create_cell(cell, pbc=(True, True, True))
+
+        return header, num_domains, pbc, cell, body
+    
+    @staticmethod
+    def parse_exadis_header(filename: str):
+        header: dict[str, Any] = {"dataDecompGeometry": [1, 1, 1]}
+        pbc = (True, True, True)
+        cell = np.zeros((3, 4))
+
+        def parse_values(tokens: list[str]) -> int | float | str | list[int | float]:
+            values = []
+            for token in tokens:
+                try:
+                    values.append(__class__.parse_number(token))
+                except ValueError:
+                    return " ".join(tokens)
+            return values[0] if len(values) == 1 else values
+
+        line_num = 0
+        with open(filename, "r") as f:
+            while line := f.readline():
+                line_num += 1
+
+                if __class__.skip_line(line):
+                    continue
+                tokens = line.split()
+                if not tokens:
+                    continue
+
+                key = tokens[0]
+                if key == "Nnodes":
+                    header["nodeCount"] = int(tokens[1])
+                    break
+                elif key == "pbc":
+                    pbc = tuple(bool(int(t)) for t in tokens[1:4])
+                    header["pbc"] = [int(t) for t in tokens[1:4]]
+                elif key == "H":
+                    h = [float(t) for t in tokens[1:10]]
+                    cell[:, :3] = np.asarray(h, dtype=float).reshape((3, 3))
+                    header["cellVectors"] = [
+                        h[0:3],
+                        h[3:6],
+                        h[6:9],
+                    ]
+                elif key == "origin":
+                    origin = [float(t) for t in tokens[1:4]]
+                    cell[:, 3] = origin
+                    header["origin"] = origin
+                    header["minCoordinates"] = origin
+                elif key == "crystal" and len(tokens) > 2:
+                    header[f"crystal_{tokens[1]}"] = parse_values(tokens[2:])
+                else:
+                    header[key] = parse_values(tokens[1:])
+
+        return header, pbc, cell, line_num
+
+    @staticmethod
+    def parse_exadis_file(filename: str):
+
+        header, pbc, cell, line_num = __class__.parse_exadis_header(filename)
+
+        node_count = header["nodeCount"]
+        nodes = np.loadtxt(filename, skiprows=line_num, max_rows=node_count)
+        if nodes.shape[1] == 5:
+            nodes = np.hstack((np.zeros((node_count, 1)), nodes))
+        elif nodes.shape[1] == 7:
+            nodes = nodes[:,1:]
+
+        line_num = line_num + node_count + 2
+        segs = np.loadtxt(filename, skiprows=line_num)
+        header["segmentCount"] = segs.shape[0]
+
+        if "minCoordinates" not in header:
+            header["minCoordinates"] = [0.0, 0.0, 0.0]
+        if "cellVectors" not in header:
+            raise ValueError("ExaDiS restart file is missing H cell matrix")
+
+        cell_vectors = np.asarray(header["cellVectors"], dtype=float)
+        lower = np.asarray(header["minCoordinates"], dtype=float)
+        upper = lower + np.sum(cell_vectors, axis=0)
+        header["maxCoordinates"] = upper.tolist()
+
+        num_domains = 1
+        body = {"nodes": nodes, "segs": segs}
+
+        return header, num_domains, pbc, cell, body
+
+    @staticmethod
+    def generate_connectivity(
+        nodes_constraint: np.ndarray, segs_indices: np.ndarray
+    ) -> list[list[tuple[int, int, int]]]:
+        conn: list[list[tuple[int, int, int]]] = [[] for _ in nodes_constraint]
+        for i, (n1, n2) in enumerate(segs_indices):
+            conn[n1].append((n2, i, 1))
+            conn[n2].append((n1, i, -1))
+        return conn
+
+    @staticmethod
+    def build_links(
+        cell,
+        nodes_pos: np.ndarray, nodes_constraint: np.ndarray,
+        segs_indices: np.ndarray, segs_bvec: np.ndarray, segs_nvec: np.ndarray,
+    ):
+        conn = __class__.generate_connectivity(nodes_constraint, segs_indices)
+        is_discretization = [
+            len(node_conn) == 2 and constr == 0
+            for constr, node_conn in zip(nodes_constraint, conn)
+        ]
+        visited = [-1] * len(nodes_constraint)
+        try:
+            seg_deltas = np.asarray(
+                cell.delta_vector(
+                    nodes_pos[segs_indices[:,0]], nodes_pos[segs_indices[:,1]]
+                )
+            )
+            if seg_deltas.shape != segs_bvec.shape:
+                raise TypeError
+        except (TypeError, ValueError):
+            seg_deltas = None
+
+        def next_connection(node_index: int, prev_index: int) -> tuple[int, int, int]:
+            node_conn = conn[node_index]
+            neighbor, seg_index, order = node_conn[0]
+            if neighbor != prev_index:
+                return neighbor, seg_index, order
+            return node_conn[1]
+
+        num_physical_nodes = 0
+        nl = 0
+
+        link_positions = []
+        link_sections = []
+        link_bvecs = []
+        link_nvecs = []
+
+        # Links connected to physical nodes: junctions, endpoints, and constrained nodes.
+        for n, node_conn in enumerate(conn):
+            if is_discretization[n]:
+                continue
+            if visited[n] == -1:
+                visited[n] = num_physical_nodes
+                num_physical_nodes += 1
+
+            for nn, il, order in node_conn:
+                if visited[nn] == -1:
+                    position = nodes_pos[n]
+                    link_positions.append(position)
+                    if seg_deltas is None:
+                        position = position + cell.delta_vector(position, nodes_pos[nn])
+                    else:
+                        position = position + order * seg_deltas[il]
+                    link_positions.append(position)
+                    link_sections.append(nl) # first node
+                    link_sections.append(nl) # second node
+                    link_bvecs.append(order * segs_bvec[il])
+                    link_nvecs.append(order * segs_nvec[il])
+                    prev = n
+
+                    if not is_discretization[nn]:
+                        visited[nn] = num_physical_nodes
+                        num_physical_nodes += 1
+                        nl += 1
+                        continue
+
+                    visited[nn] = 1
+                    while is_discretization[nn]:
+                        prev, (nn, ilp, order) = nn, next_connection(nn, prev)
+                        if seg_deltas is None:
+                            position = position + cell.delta_vector(position, nodes_pos[nn])
+                        else:
+                            position = position + order * seg_deltas[ilp]
+                        link_positions.append(position)
+                        link_sections.append(nl)
+
+                        if not is_discretization[nn]:
+                            if visited[nn] == -1:
+                                visited[nn] = num_physical_nodes
+                                num_physical_nodes += 1
+                            nl += 1
+                        else:
+                            visited[nn] = 1
+                elif not is_discretization[nn] and nn > n:
+                    position = nodes_pos[n]
+                    link_positions.append(position)
+                    if seg_deltas is None:
+                        position = position + cell.delta_vector(position, nodes_pos[nn])
+                    else:
+                        position = position + order * seg_deltas[il]
+                    link_positions.append(position)
+                    link_sections.append(nl) # first node
+                    link_sections.append(nl) # second node
+                    link_bvecs.append(order * segs_bvec[il])
+                    link_nvecs.append(order * segs_nvec[il])
+                    nl += 1
+
+        # Closed loops made only of discretization nodes.
+        for n, node_conn in enumerate(conn):
+            if visited[n] != -1 or not is_discretization[n]:
+                continue
+            visited[n] = num_physical_nodes
+            num_physical_nodes += 1
+            prev = n
+            nn, il, order = node_conn[0]
+            position = nodes_pos[n]
+            link_positions.append(position)
+            if seg_deltas is None:
+                position = position + cell.delta_vector(position, nodes_pos[nn])
+            else:
+                position = position + order * seg_deltas[il]
+            link_positions.append(position)
+            link_sections.append(nl) # first node
+            link_sections.append(nl) # second node
+            link_bvecs.append(order * segs_bvec[il])
+            link_nvecs.append(order * segs_nvec[il])
+            while nn != n:
+                visited[nn] = 1
+                prev, (nn, ilp, order) = nn, next_connection(nn, prev)
+                if seg_deltas is None:
+                    position = position + cell.delta_vector(position, nodes_pos[nn])
+                else:
+                    position = position + order * seg_deltas[ilp]
+                link_positions.append(position)
+                link_sections.append(nl)
+            nl += 1
+
+        link_positions = np.asarray(link_positions)
+        link_sections = np.asarray(link_sections)
+        link_bvecs = np.asarray(link_bvecs)
+        link_bvecs = link_bvecs[link_sections]
+        link_nvecs = np.asarray(link_nvecs)
+        link_nvecs = link_nvecs[link_sections]
+
+        return link_positions, link_sections, link_bvecs, link_nvecs
+
+    def parse(self, data: DataCollection, filename: str, frame_info: Any, **kwargs: Any):
+
+        # Read data
+        file_format = __class__.detect_format(filename)
+        if file_format == DDDFileFormat.DATAFILE:
+            header, num_domains, pbc, cell, body = __class__.parse_data_file(filename)
+        elif file_format == DDDFileFormat.EXADIS_RESTART:
+            header, num_domains, pbc, cell, body = __class__.parse_exadis_file(filename)
+        else:
+            raise ValueError(f"OpenDiSFileReader does not support file type")
+
+        for k, v in header.items():
+            data.attributes[k] = v
+
+        cell = data.create_cell(cell, pbc=pbc)
 
         # Scale line/node width to ~0.1 % of the cell diagonal for visual clarity
         self.lines_vis.width = 1 / 1000 * np.linalg.norm(cell[:3, :3].diagonal())
 
+        # Create nodes
+        nodes = body["nodes"]
+        assert len(nodes) == header["nodeCount"]
+        nodes_pos, nodes_constraint = nodes[:,2:5], nodes[:,5]
+        nodes_pos = cell.wrap_point(nodes_pos)
+
         particles = data.create_particles(count=header["nodeCount"], vis_params={'title': 'Nodes'})
-        identifier = particles.create_property("Particle Identifier")
+        tags = particles.create_property("Node Tag", dtype=int, components=('domain', 'index'), data=nodes[:,0:2].astype(int))
         particle_type = particles.create_property("Particle Type")
-        positions = particles.create_property("Position")
-        num_arms = particles.create_property("Num Arms", dtype=int)
-        constraint = particles.create_property("Constraint", dtype=int)
+        positions = particles.create_property("Position", data=nodes_pos)
+        constraints = particles.create_property("Constraint", dtype=int, data=nodes_constraint)
 
         node_type = particle_type.add_type_name("Node", data.particles)
         node_type.radius = self.lines_vis.width / 2
         particle_type[:] = node_type.id
 
-        for i, node in enumerate(body["nodalData"]):
-            identifier[i] = node.node_tag
-            positions[i] = node.pos
-            num_arms[i] = node.num_arms
-            constraint[i] = node.constrain
-            yield i / len(body["nodalData"])
-
-        positions = []
-        sections = []
-        bvecs = []
-        nvecs = []
-
-        # Line objects returned by the generator via its StopIteration value.
-        lines = yield from self.walk_lines(body["nodalData"])
-
-        ref_point = np.asarray(data.cell[:, 3])
-        for counter, line in enumerate(lines):
-            ref_point = data.cell.wrap_point(ref_point)
-            for segment in line.segments:
-                # Reverse so the segment walks from the far end back to the junction,
-                # keeping ref_point continuous across consecutive segments of the line.
-                segment = list(reversed(segment))
-                ref_point = yield from self.walk_line(
-                    segment,
-                    ref_point,
-                    cell,
-                    positions,
-                    sections,
-                    bvecs,
-                    nvecs,
-                    counter,
-                )
-
         self.lines_vis.color = node_type.color
 
-        # Empty lists would be interpreted as shape (0,) arrays, which cannot be
-        # assigned to the (0, 3) vector properties, so give them the right shape.
-        positions = np.asarray(positions, dtype=float).reshape((-1, 3))
-        bvecs = np.asarray(bvecs, dtype=float).reshape((-1, 3))
-        nvecs = np.asarray(nvecs, dtype=float).reshape((-1, 3))
+        # Create lines
+        segs = body["segs"]
+        assert len(segs) == header["segmentCount"]
+        segs_indices = segs[:,0:2].astype(int)
+        segs_bvec, segs_nvec = segs[:,2:5], segs[:,5:8]
 
-        lines = data.lines.create("Arms", count=len(positions), vis=self.lines_vis)
-        lines.create_property("Position", data=positions)
-        lines.create_property("Section", data=sections)
-        lines.create_property("Burgers vector", data=bvecs, components=["X", "Y", "Z"])
+        link_positions, link_sections, link_bvecs, link_nvecs = \
+            __class__.build_links(cell, nodes_pos, nodes_constraint, segs_indices, segs_bvec, segs_nvec)
+
+        lines = data.lines.create("Dislocations", count=len(link_positions), vis=self.lines_vis)
+        lines.create_property("Position", data=link_positions)
+        lines.create_property("Section", data=link_sections)
+        lines.create_property("Burgers vector", data=link_bvecs, components=["X", "Y", "Z"])
         lines.create_property(
-            "Burgers vector magnitude", data=np.linalg.norm(bvecs, axis=1)
+            "Burgers vector magnitude", data=np.linalg.norm(link_bvecs, axis=1)
         )
-        lines.create_property("Normal vector", data=nvecs, components=["X", "Y", "Z"])
+        lines.create_property("Normal vector", data=link_nvecs, components=["X", "Y", "Z"])
+
+        print(f"Number of nodes: {header['nodeCount']}")
+        print(f"Number of segments: {header['segmentCount']}")
+        print(f"Number of links: {link_sections[-1]+1 if len(link_sections) > 0 else 0}")
