@@ -10,19 +10,13 @@ on:
     branches: [ "main" ]
 jobs:
   build:
-    if: ${{ false }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.7", "3.8", "3.9", "3.10", "3.11"]
-        exclude:
-          - os: macos-latest
-            python-version: "3.7"
-          - os: macos-latest
-            python-version: "3.8"
+        python-version: ["3.12","3.13","3.14"]
     steps:
     - uses: actions/checkout@v3
     - name: Install apt dependencies
