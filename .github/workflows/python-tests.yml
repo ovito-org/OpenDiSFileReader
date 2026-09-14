@@ -19,17 +19,15 @@ jobs:
         python-version: ["3.12","3.13","3.14"]
     steps:
     - uses: actions/checkout@v6
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v7
+    - name: Set up uv with Python ${{ matrix.python-version }}
+      uses: astral-sh/setup-uv@v7
       with:
         python-version: ${{ matrix.python-version }}
-        check-latest: true
+        enable-cache: true
     - name: Install python dependencies
       run: |
-        python -m pip install --upgrade pip
-        python -m pip install pytest
-        python -m pip install ovito
-        python -m pip install .
+        uv venv
+        uv pip install pytest .
     - name: Test with pytest
       run: |
-        pytest
+        uv run --no-sync pytest
