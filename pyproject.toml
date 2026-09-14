@@ -7,7 +7,11 @@ name = "OpenDiSFileReader"
 version = "2026.4"
 description = "File reader for the OpenDiS data format"
 keywords = ["ovito", "ovito-extension"]
-authors = [{name = "Daniel Utt", email = "utt@ovito.org"}, {name = "Alexander Stukowski", email = "stukowski@ovito.org"}]
+authors = [
+    {name = "Daniel Utt", email = "utt@ovito.org"},
+    {name = "Alexander Stukowski", email = "stukowski@ovito.org"},
+    {name = "Nicolas Bertin", email = "bertin1@llnl.gov"}
+]
 maintainers = [{name = "Daniel Utt", email = "utt@ovito.org"}]
 license = {text = "MIT"}
 readme = "README.md"
